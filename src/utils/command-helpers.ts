@@ -121,6 +121,106 @@ export function assessRiskWithTolerance(
 }
 
 /**
+ * 获取币种的最小数量和步长
+ */
+async function getSymbolLotSize(binanceService: any, symbol: string): Promise<{ minQty: number; stepSize: number }> {
+  const defaults = { minQty: 0.001, stepSize: 0.001 };
+  
+  try {
+    const symbolInfo = await binanceService.getSymbolInfo(symbol);
+    const lotSizeFilter = symbolInfo?.filters?.find((f: any) => f.filterType === 'LOT_SIZE');
+    
+    if (lotSizeFilter) {
+      return {
+        minQty: parseFloat(lotSizeFilter.minQty || defaults.minQty.toString()),
+        stepSize: parseFloat(lotSizeFilter.stepSize || defaults.stepSize.toString())
+      };
+    }
+  } catch (error) {
+    console.warn(`   ⚠️ Failed to get symbol info for ${symbol}, using defaults`);
+  }
+  
+  return defaults;
+}
+
+/**
+ * 获取当前价格（优先使用position中的价格）
+ */
+async function getCurrentPrice(binanceService: any, symbol: string, positionPrice?: number): Promise<number> {
+  if (positionPrice) return positionPrice;
+  
+  try {
+    const ticker = await binanceService.get24hrTicker(symbol);
+    return parseFloat(ticker.lastPrice || ticker.price);
+  } catch (error) {
+    console.warn(`   ⚠️ Failed to get current price for ${symbol}`);
+    return 0;
+  }
+}
+
+/**
+ * 根据保证金计算并调整数量（考虑最小数量和步长）
+ */
+function calculateAdjustedQuantity(
+  marginToUse: number,
+  leverage: number,
+  currentPrice: number,
+  minQty: number,
+  stepSize: number
+): number {
+  const notionalValue = marginToUse * leverage;
+  let quantity = notionalValue / currentPrice;
+  
+  // 根据stepSize向下取整到有效步长
+  const steps = Math.floor(quantity / stepSize);
+  quantity = steps * stepSize;
+  
+  // 确保不少于最小数量
+  return Math.max(quantity, minQty);
+}
+
+/**
+ * 计算开仓数量（使用20%保证金）
+ */
+async function calculateOpeningQuantity(
+  executor: TradingExecutor,
+  tradingPlan: TradingPlan,
+  followPlan: FollowPlan
+): Promise<void> {
+  try {
+    const accountInfo = await executor.getAccountInfo();
+    const totalAvailableBalance = parseFloat(accountInfo.availableBalance);
+    const marginToUse = totalAvailableBalance * 0.2;
+    
+    const binanceService = (executor as any).binanceService;
+    if (!binanceService) {
+      console.warn(`   ⚠️ binanceService not available, using original quantity: ${tradingPlan.quantity}`);
+      return;
+    }
+    
+    // 获取币种信息和价格
+    const { minQty, stepSize } = await getSymbolLotSize(binanceService, tradingPlan.symbol);
+    console.log(`   📊 Symbol info: minQty=${minQty}, stepSize=${stepSize}`);
+    
+    const currentPrice = await getCurrentPrice(binanceService, tradingPlan.symbol, followPlan.position?.current_price);
+    
+    if (currentPrice <= 0) {
+      console.warn(`   ⚠️ Unable to get current price for ${tradingPlan.symbol}, using original quantity: ${tradingPlan.quantity}`);
+      return;
+    }
+    
+    // 计算并调整数量
+    const adjustedQuantity = calculateAdjustedQuantity(marginToUse, tradingPlan.leverage, currentPrice, minQty, stepSize);
+    const formattedStr = binanceService.formatQuantity(adjustedQuantity, tradingPlan.symbol);
+    tradingPlan.quantity = Number(formattedStr);
+    
+    console.log(`   💰 Opening 10% position for ${tradingPlan.symbol}: ${tradingPlan.quantity.toFixed(6)} (Margin: $${marginToUse.toFixed(2)}, Price: $${currentPrice.toFixed(2)})`);
+  } catch (error) {
+    console.warn(`   ⚠️ Failed to calculate quantity: ${error instanceof Error ? error.message : 'Unknown error'}, using original quantity: ${tradingPlan.quantity}`);
+  }
+}
+
+/**
  * 执行交易并保存订单历史
  */
 export async function executeTradeWithHistory(
@@ -131,8 +231,11 @@ export async function executeTradeWithHistory(
 ): Promise<StopOrderExecutionResult> {
   let result: StopOrderExecutionResult;
 
-  // 如果有 releasedMargin,使用它来计算交易数量
-  if (followPlan.releasedMargin && followPlan.releasedMargin > 0 && followPlan.position) {
+  // 如果是ENTER操作（开仓），使用10%保证金计算数量
+  if (followPlan.action === "ENTER") {
+    await calculateOpeningQuantity(executor, tradingPlan, followPlan);
+  } else if (followPlan.releasedMargin && followPlan.releasedMargin > 0 && followPlan.position) {
+    // 对于非ENTER操作（如平仓），使用 releasedMargin
     const notionalValue = followPlan.releasedMargin * followPlan.leverage;
     const adjustedQuantity = notionalValue / followPlan.position.current_price;
     console.log(`   💰 Using released margin: $${followPlan.releasedMargin.toFixed(2)} (${followPlan.leverage}x leverage) → Quantity: ${adjustedQuantity.toFixed(4)}`);
